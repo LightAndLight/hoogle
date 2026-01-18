@@ -21,6 +21,7 @@ import System.Exit
 import qualified System.Process.ByteString as BS
 import qualified Data.ByteString.UTF8 as UTF8
 import System.Directory
+import System.Environment
 import Data.Maybe
 import Data.Tuple.Extra
 import qualified Data.Map.Strict as Map
@@ -86,9 +87,29 @@ packagePopularity cbl = mp `seq` (errs, mp)
 ---------------------------------------------------------------------
 -- READERS
 
+-- | Returns a list of extra ghc-pkg flags, and an optional list of enabled packages.
+readGhcEnvironment :: IO ([String], Maybe [String])
+readGhcEnvironment = do
+    mFile <- lookupEnv "GHC_ENVIRONMENT"
+    case mFile of
+        Nothing -> pure ([], Nothing)
+        Just file -> do
+            contents <- readFile file
+            let
+                f line rest@(flags, enabledPackages)
+                    | line == "clear-package-db" = ("--no-user-package-db" : flags, enabledPackages)
+                    | line == "global-package-db" = ("--global" : flags, enabledPackages)
+                    | Just packageDb <- stripPrefix "package-db " line = (("--package-db=" ++ packageDb) : flags, enabledPackages)
+                    | Just name <- stripPrefix "package-id " line = (flags, name : enabledPackages)
+                    | otherwise = rest
+
+            let (flags, enabledPackages) = foldr f ([], []) (lines contents)
+            pure (flags, Just enabledPackages)
+
 -- | Run 'ghc-pkg' and get a list of packages which are installed.
 readGhcPkg :: Settings -> IO (Map.Map PkgName Package)
 readGhcPkg settings = do
+    (ghcPkgFlags, mEnabledPackages) <- readGhcEnvironment
     topdir <- findExecutable "ghc-pkg"
     (exit, stdout, stderr) <-
     -- From GHC 9.0.1, the `haddock-html` field in `*.conf` files for GHC boot
@@ -108,31 +129,57 @@ readGhcPkg settings = do
     -- correct manually the affected `*.conf` files.
 
     -- important to use BS process reading so it's in Binary format, see #194
-      BS.readProcessWithExitCode "ghc-pkg" ["dump", "--expand-pkgroot"] mempty
+      BS.readProcessWithExitCode "ghc-pkg" (["dump", "--expand-pkgroot"] ++ ghcPkgFlags) mempty
     when (exit /= ExitSuccess) $
         errorIO $ "Error when reading from ghc-pkg, " ++ show exit ++ "\n" ++ UTF8.toString stderr
     let g (stripPrefix "$topdir" -> Just x) | Just t <- topdir = takeDirectory t ++ x
         -- ^ Backwards compatibility with GHC < 9.0
         g x = x
     let fixer p = p{packageLibrary = True, packageDocs = g <$> packageDocs p}
-    let f ((stripPrefix "name: " -> Just x):xs) = Just (mkPackageName $ trimStart x, fixer $ readCabal settings $ bstrPack $ unlines xs)
-        f _ = Nothing
+
     let
-        withHaddockHtml (name, package) =
+        findPackageId [] = Nothing
+        findPackageId (x:xs)
+            | Just rest <- stripPrefix "id:" x =
+                if null rest
+                    then
+                        -- some package database entries have the `id` field's value
+                        -- on the next line.
+                        --
+                        -- should really use a proper parser.
+                        case xs of
+                            x':_xs' -> Just $ trimStart x'
+                            [] -> Nothing
+                    else Just $ trimStart rest
+            | otherwise = findPackageId xs
+
+    let
+        f ((stripPrefix "name: " -> Just x):xs)
+            | Just pId <- findPackageId xs
+            , maybe True (pId `elem`) mEnabledPackages =
+            Just (pId, mkPackageName $ trimStart x, fixer $ readCabal settings $ bstrPack $ unlines xs)
+        f _ = Nothing
+
+    let
+        withHaddockHtml (pId, name, package) =
             case packageDocs package of
                 Nothing -> do
-                    packageDocs' <- readGhcPkgHaddockHtml (unPackageName name)
-                    pure (name, package{packageDocs = packageDocs'})
+                    packageDocs' <- readGhcPkgHaddockHtml ghcPkgFlags pId
+                    pure (pId, name, package{packageDocs = packageDocs'})
                 Just{} ->
-                    pure (name, package)
-    fmap Map.fromList $ traverse withHaddockHtml $ mapMaybe f $ splitOn ["---"] $ lines $ filter (/= '\r') $ UTF8.toString stdout
+                    pure (pId, name, package)
+    
+    let dump = splitOn ["---"] $ lines $ filter (/= '\r') $ UTF8.toString stdout
+    Map.fromList . fmap (\(_pId, name, pkg) -> (name, pkg)) <$> traverse withHaddockHtml (mapMaybe f dump)
 
 readGhcPkgHaddockHtml ::
-    -- | Package name
+    -- | Extra ghc-pkg flags
+    [String] ->
+    -- | Package ID
     String ->
     IO (Maybe FilePath)
-readGhcPkgHaddockHtml packageName = do
-    let args = ["field", packageName, "haddock-html", "--expand-pkgroot", "--simple"]
+readGhcPkgHaddockHtml flags pkgId = do
+    let args = ["field", pkgId, "haddock-html", "--unit-id", "--expand-pkgroot", "--simple"] ++ flags
     (exit, stdout, stderr) <- BS.readProcessWithExitCode "ghc-pkg" args mempty
     if exit /= ExitSuccess
         then do

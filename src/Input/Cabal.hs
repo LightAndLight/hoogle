@@ -117,8 +117,32 @@ readGhcPkg settings = do
     let fixer p = p{packageLibrary = True, packageDocs = g <$> packageDocs p}
     let f ((stripPrefix "name: " -> Just x):xs) = Just (mkPackageName $ trimStart x, fixer $ readCabal settings $ bstrPack $ unlines xs)
         f _ = Nothing
-    pure $ Map.fromList $ mapMaybe f $ splitOn ["---"] $ lines $ filter (/= '\r') $ UTF8.toString stdout
+    let
+        withHaddockHtml (name, package) =
+            case packageDocs package of
+                Nothing -> do
+                    packageDocs' <- readGhcPkgHaddockHtml (unPackageName name)
+                    pure (name, package{packageDocs = packageDocs'})
+                Just{} ->
+                    pure (name, package)
+    fmap Map.fromList $ traverse withHaddockHtml $ mapMaybe f $ splitOn ["---"] $ lines $ filter (/= '\r') $ UTF8.toString stdout
 
+readGhcPkgHaddockHtml ::
+    -- | Package name
+    String ->
+    IO (Maybe FilePath)
+readGhcPkgHaddockHtml packageName = do
+    let args = ["field", packageName, "haddock-html", "--expand-pkgroot", "--simple"]
+    (exit, stdout, stderr) <- BS.readProcessWithExitCode "ghc-pkg" args mempty
+    if exit /= ExitSuccess
+        then do
+            putStrLn "error when calling ghc-pkg:"
+            putStrLn $ "args: " ++ show args
+            putStrLn $ "exit: " ++ show exit
+            putStrLn $ "stderr: " ++ UTF8.toString stderr
+            pure Nothing
+        else
+            pure . Just . trimEnd $ UTF8.toString stdout
 
 -- | Given a tarball of Cabal files, parse the latest version of each package.
 parseCabalTarball :: Settings -> FilePath -> IO (Map.Map PkgName Package)

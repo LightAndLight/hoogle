@@ -11,6 +11,7 @@ module Input.Cabal(
 import Input.Settings
 
 import Data.List.Extra
+import Data.Map (Map)
 import System.FilePath
 import Control.DeepSeq
 import Control.Exception.Extra
@@ -20,7 +21,6 @@ import General.Str
 import System.Exit
 import qualified System.Process.ByteString as BS
 import qualified Data.ByteString.UTF8 as UTF8
-import System.Directory
 import Data.Maybe
 import Data.Tuple.Extra
 import qualified Data.Map.Strict as Map
@@ -30,12 +30,18 @@ import Control.Applicative
 import Prelude
 
 import Distribution.Compat.Lens (toListOf)
+import qualified Distribution.InstalledPackageInfo as IPI
+import Distribution.Package (packageId, UnitId, pkgName)
 import qualified Distribution.PackageDescription as PD
 import qualified Distribution.PackageDescription.Configuration as PD
 import qualified Distribution.PackageDescription.Parsec as PD
 import qualified Distribution.Pretty
+import Distribution.Text (display)
 import qualified Distribution.Types.BuildInfo.Lens as Lens
-import Distribution.Types.PackageName (mkPackageName, unPackageName)
+import Distribution.Types.LibraryVisibility (LibraryVisibility(..))
+import Distribution.Types.PackageDescription (license')
+import Distribution.Types.PackageId (pkgVersion)
+import Distribution.Types.PackageName (unPackageName)
 import Distribution.Types.Version (versionNumbers)
 import Distribution.Utils.ShortText (fromShortText)
 import Hackage.RevDeps (lastVersionsOfPackages)
@@ -72,6 +78,7 @@ instance NFData Package where
 
 -- | Given a set of packages, return the popularity of each package, along with any warnings
 --   about packages imported but not found.
+
 packagePopularity :: Map.Map PkgName Package -> ([String], Map.Map PkgName Int)
 packagePopularity cbl = mp `seq` (errs, mp)
     where
@@ -89,7 +96,6 @@ packagePopularity cbl = mp `seq` (errs, mp)
 -- | Run 'ghc-pkg' and get a list of packages which are installed.
 readGhcPkg :: Settings -> IO (Map.Map PkgName Package)
 readGhcPkg settings = do
-    topdir <- findExecutable "ghc-pkg"
     (exit, stdout, stderr) <-
     -- From GHC 9.0.1, the `haddock-html` field in `*.conf` files for GHC boot
     -- libraries has used `${pkgroot}`, which can be expanded in the output.
@@ -111,14 +117,78 @@ readGhcPkg settings = do
       BS.readProcessWithExitCode "ghc-pkg" ["dump", "--expand-pkgroot"] mempty
     when (exit /= ExitSuccess) $
         errorIO $ "Error when reading from ghc-pkg, " ++ show exit ++ "\n" ++ UTF8.toString stderr
-    let g (stripPrefix "$topdir" -> Just x) | Just t <- topdir = takeDirectory t ++ x
-        -- ^ Backwards compatibility with GHC < 9.0
-        g x = x
-    let fixer p = p{packageLibrary = True, packageDocs = g <$> packageDocs p}
-    let f ((stripPrefix "name: " -> Just x):xs) = Just (mkPackageName $ trimStart x, fixer $ readCabal settings $ bstrPack $ unlines xs)
-        f _ = Nothing
-    pure $ Map.fromList $ mapMaybe f $ splitOn ["---"] $ lines $ filter (/= '\r') $ UTF8.toString stdout
 
+    installedPackages <- parsePackages stdout
+
+    pure $
+        Map.fromList
+            [ ( pkgName $ packageId installedPackage
+              , fromInstalledPackage settings installedPackages installedPackage
+              )
+            | (_unitId, installedPackage) <- Map.toList installedPackages
+            ]
+    where
+        parsePackages :: UTF8.ByteString -> IO (Map UnitId IPI.InstalledPackageInfo)
+        parsePackages input =
+            Map.fromList . fmap ((,) <$> IPI.installedUnitId <*> id) . catMaybes <$>
+            traverse
+                (\input ->
+                    case IPI.parseInstalledPackageInfo . bstrPack $ unlines input of
+                        Left errors -> do
+                            mapM_ (\msg -> putStrLn $ "error (parsing ghc-pkg output): " ++ msg) errors
+                            pure Nothing
+                        Right (warnings, package) -> do
+                            mapM_ (\msg -> putStrLn $ "warning (parsing ghc-pkg output): " ++ msg) warnings
+                            pure $ Just package
+                )
+                (splitOn ["---"] . lines . filter (/= '\r') $ UTF8.toString input)
+
+fromInstalledPackage ::
+    Settings ->
+    Map UnitId IPI.InstalledPackageInfo ->
+    IPI.InstalledPackageInfo ->
+    Package
+fromInstalledPackage Settings{..} installedPackages ipi = Package{..}
+    where
+        pkgId = packageId ipi
+
+        packageDepends =
+            fmap
+                (\unitId ->
+                    maybe
+                        (error $ display unitId ++ " missing from installed packages") (pkgName . packageId)
+                        (Map.lookup unitId installedPackages)
+                )
+                (IPI.depends ipi)
+        packageVersion = strPack $ intercalate "." $ map show $ versionNumbers $ pkgVersion pkgId
+        packageSynopsis = strPack $ fromShortText $ IPI.synopsis ipi
+        packageLibrary = IPI.libVisibility ipi == LibraryVisibilityPublic
+        packageDocs = listToMaybe $ IPI.haddockHTMLs ipi
+
+        unpackLicenseExpression (SPDX.EOr x y) = unpackLicenseExpression x ++ unpackLicenseExpression y
+        unpackLicenseExpression x = [x]
+
+        packageLicenses = case license' $ IPI.license ipi of
+            SPDX.NONE -> []
+            SPDX.License licExpr -> map (show . Distribution.Pretty.pretty) $
+                unpackLicenseExpression licExpr
+        packageCategories =
+            filter (not . null) $ split (`elem` " ,") $
+                fromShortText $ IPI.category ipi
+        packageAuthor = fromShortText $ IPI.author ipi
+        packageMaintainer = fromShortText $ IPI.maintainer ipi
+
+        packageTags = map (both strPack) $ nubOrd $ concat
+            [ map ("license",) packageLicenses
+            , map ("category",) packageCategories
+            , map ("author",) (concatMap cleanup [packageAuthor, packageMaintainer])
+            ]
+
+        -- split on things like "," "&" "and", then throw away email addresses, replace spaces with "-" and rename
+        cleanup =
+            filter (/= "") .
+            map (renameTag . intercalate "-" . filter ('@' `notElem`) . words . takeWhile (`notElem` "<(")) .
+            concatMap (map unwords . split (== "and") . words) . split (`elem` ",&")
 
 -- | Given a tarball of Cabal files, parse the latest version of each package.
 parseCabalTarball :: Settings -> FilePath -> IO (Map.Map PkgName Package)

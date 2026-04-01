@@ -42,8 +42,8 @@ import Distribution.Types.LibraryVisibility (LibraryVisibility(..))
 import Distribution.Types.PackageDescription (license')
 import Distribution.Types.PackageId (pkgVersion)
 import Distribution.Types.PackageName (unPackageName)
-import Distribution.Types.Version (versionNumbers)
-import Distribution.Utils.ShortText (fromShortText)
+import Distribution.Types.Version (Version, versionNumbers)
+import Distribution.Utils.ShortText (ShortText, fromShortText)
 import Hackage.RevDeps (lastVersionsOfPackages)
 import qualified Distribution.SPDX as SPDX
 
@@ -148,7 +148,7 @@ fromInstalledPackage ::
     Map UnitId IPI.InstalledPackageInfo ->
     IPI.InstalledPackageInfo ->
     Package
-fromInstalledPackage Settings{..} installedPackages ipi = Package{..}
+fromInstalledPackage settings installedPackages ipi = Package{..}
     where
         pkgId = packageId ipi
 
@@ -160,35 +160,17 @@ fromInstalledPackage Settings{..} installedPackages ipi = Package{..}
                         (Map.lookup unitId installedPackages)
                 )
                 (IPI.depends ipi)
-        packageVersion = strPack $ intercalate "." $ map show $ versionNumbers $ pkgVersion pkgId
+        packageVersion = mkPackageVersion $ pkgVersion pkgId
         packageSynopsis = strPack $ fromShortText $ IPI.synopsis ipi
         packageLibrary = IPI.libVisibility ipi == LibraryVisibilityPublic
         packageDocs = listToMaybe $ IPI.haddockHTMLs ipi
 
-        unpackLicenseExpression (SPDX.EOr x y) = unpackLicenseExpression x ++ unpackLicenseExpression y
-        unpackLicenseExpression x = [x]
-
-        packageLicenses = case license' $ IPI.license ipi of
-            SPDX.NONE -> []
-            SPDX.License licExpr -> map (show . Distribution.Pretty.pretty) $
-                unpackLicenseExpression licExpr
-        packageCategories =
-            filter (not . null) $ split (`elem` " ,") $
-                fromShortText $ IPI.category ipi
+        packageLicenses = mkPackageLicenses . license' $ IPI.license ipi
+        packageCategories = mkPackageCategories $ IPI.category ipi
         packageAuthor = fromShortText $ IPI.author ipi
         packageMaintainer = fromShortText $ IPI.maintainer ipi
 
-        packageTags = map (both strPack) $ nubOrd $ concat
-            [ map ("license",) packageLicenses
-            , map ("category",) packageCategories
-            , map ("author",) (concatMap cleanup [packageAuthor, packageMaintainer])
-            ]
-
-        -- split on things like "," "&" "and", then throw away email addresses, replace spaces with "-" and rename
-        cleanup =
-            filter (/= "") .
-            map (renameTag . intercalate "-" . filter ('@' `notElem`) . words . takeWhile (`notElem` "<(")) .
-            concatMap (map unwords . split (== "and") . words) . split (`elem` ",&")
+        packageTags = mkPackageTags settings packageLicenses packageCategories [packageAuthor, packageMaintainer]
 
 -- | Given a tarball of Cabal files, parse the latest version of each package.
 parseCabalTarball :: Settings -> FilePath -> IO (Map.Map PkgName Package)
@@ -213,38 +195,59 @@ readCabal settings src = case PD.parseGenericPackageDescriptionMaybe src of
     Just gpd -> readCabal' settings gpd
 
 readCabal' :: Settings -> PD.GenericPackageDescription -> Package
-readCabal' Settings{..} gpd = Package{..}
+readCabal' settings gpd = Package{..}
     where
         pd = PD.flattenPackageDescription gpd
         pkgId = PD.package pd
 
         packageDepends = nubOrd $ foldMap (map (\(PD.Dependency pkg _ _) -> pkg) . PD.targetBuildDepends) $ toListOf Lens.traverseBuildInfos gpd
-        packageVersion = strPack $ intercalate "." $ map show $ versionNumbers $ PD.pkgVersion pkgId
+        packageVersion = mkPackageVersion $ PD.pkgVersion pkgId
         packageSynopsis = strPack $ fromShortText $ PD.synopsis pd
         packageLibrary = PD.hasPublicLib pd
         packageDocs = Nothing
 
-        unpackLicenseExpression (SPDX.EOr x y) = unpackLicenseExpression x ++ unpackLicenseExpression y
-        unpackLicenseExpression x = [x]
-
-        packageLicenses = case PD.license pd of
-            SPDX.NONE -> []
-            SPDX.License licExpr -> map (show . Distribution.Pretty.pretty) $
-                unpackLicenseExpression licExpr
-        packageCategories =
-            filter (not . null) $ split (`elem` " ,") $
-                fromShortText $ PD.category pd
+        packageLicenses = mkPackageLicenses $ PD.license pd
+        packageCategories = mkPackageCategories $ PD.category pd
         packageAuthor = fromShortText $ PD.author pd
         packageMaintainer = fromShortText $ PD.maintainer pd
 
-        packageTags = map (both strPack) $ nubOrd $ concat
-            [ map ("license",) packageLicenses
-            , map ("category",) packageCategories
-            , map ("author",) (concatMap cleanup [packageAuthor, packageMaintainer])
-            ]
+        packageTags = mkPackageTags settings packageLicenses packageCategories [packageAuthor, packageMaintainer]
 
-        -- split on things like "," "&" "and", then throw away email addresses, replace spaces with "-" and rename
-        cleanup =
-            filter (/= "") .
-            map (renameTag . intercalate "-" . filter ('@' `notElem`) . words . takeWhile (`notElem` "<(")) .
-            concatMap (map unwords . split (== "and") . words) . split (`elem` ",&")
+mkPackageVersion :: Version -> Str
+mkPackageVersion = strPack . intercalate "." . map show . versionNumbers
+
+mkPackageLicenses :: SPDX.License -> [String]
+mkPackageLicenses license =
+    case license of
+            SPDX.NONE -> []
+            SPDX.License licExpr -> map (show . Distribution.Pretty.pretty) $
+                unpackLicenseExpression licExpr
+    where
+        unpackLicenseExpression (SPDX.EOr x y) = unpackLicenseExpression x ++ unpackLicenseExpression y
+        unpackLicenseExpression x = [x]
+
+mkPackageCategories :: ShortText -> [String]
+mkPackageCategories = filter (not . null) . split (`elem` " ,") . fromShortText
+
+mkPackageTags ::
+    Settings ->
+    -- | Licenses
+    [String] ->
+    -- | Categories
+    [String] ->
+    -- | Authors
+    [String] ->
+    [(Str, Str)]
+mkPackageTags settings licenses categories authors =
+    map (both strPack) $ nubOrd $ concat
+        [ map ("license",) licenses
+        , map ("category",) categories
+        , map ("author",) (concatMap (cleanup settings) authors)
+        ]
+
+-- split on things like "," "&" "and", then throw away email addresses, replace spaces with "-" and rename
+cleanup :: Settings -> String -> [String]
+cleanup Settings{..} =
+    filter (/= "") .
+    map (renameTag . intercalate "-" . filter ('@' `notElem`) . words . takeWhile (`notElem` "<(")) .
+    concatMap (map unwords . split (== "and") . words) . split (`elem` ",&")
